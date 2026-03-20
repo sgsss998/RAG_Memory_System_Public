@@ -25,8 +25,9 @@ REAL_API_BASE = "https://api.your-llm-provider.com"  # 你的 LLM API 地址
 HIPPOCAMPUS_URL = "http://localhost:8000/search"
 PROXY_PORT = 8080
 
-# 需要被缴械的工具列表（这些工具会在本地文件系统搜索，与 RAG 冲突）
-DISABLED_TOOLS = ["search_memories", "read_file", "search_files"]
+# 说明：本版本不再“自动缴械”任何工具。
+# 让 Claude Code/LLM 自己判断何时调用记忆工具，而不是由网关强行控制。
+DISABLED_TOOLS = []
 
 # ============== 新版 Prompt（Phase 2.0 数字分身版）==============
 # ⚠️ 请根据你的个人信息修改以下内容
@@ -98,38 +99,16 @@ def inject_memory_to_request(body: dict, user_question: str, memory_context: str
     """
     body = copy.deepcopy(body)
 
-    # 构建新版注入内容
-    if memory_context:
-        rag_injection = f"""<memory_slices>
-{memory_context}
-</memory_slices>
+    # OpenClaw 化目标：不要把“记忆切片”当成唯一答案来源。
+    # 网关默认只注入“身份锚点 + 软使用规则”，动态记忆交给 LLM/Claude Code 的工具去按需调用。
+    rag_injection = """<answering_rules>
+【使用方式（软规则）】
+1. 你拥有正常的推理能力，不要因为没有检索到记忆就卡住或复读。
+2. 只有当你需要“追溯我过去做过什么/我的偏好是什么/某次对话发生了什么”时，才去调用记忆检索工具（例如：`search_memories`）。
+3. 记忆工具返回的是“线索”，最终结论仍由你结合当前对话推理得出。
 
-<answering_rules>
-【回答优先级 - 从高到低】
-1. 身份锚点中的固定信息 → 最高优先级，直接用
-2. 记忆切片中明确是"我"说的内容 → 直接用
-3. 基于以上两点的合理推理 → 可以用
-4. 完全没有依据的猜测 → 禁止！说"记不清了"
-
-【角色辨别规则 - 重要！】
-- 记忆切片中的 ID、微信号、手机号通常是【聊天对象的】，不是你的
-- 聊天记录文件名中的信息属于【对话参与者】，需判断是谁说的
-- 当身份锚点与检索结果冲突时，以身份锚点为准
-- 不确定是谁说的内容，不要当成自己的
-
-【语言风格】
-- 禁止"根据知识库"、"检索结果显示"等机械词汇
-- 用第一人称回答，就像在回忆自己的事
-
-【安全边界】
-- 禁止调用任何工具验证信息，直接基于已有信息回答
-</answering_rules>"""
-    else:
-        rag_injection = """<answering_rules>
-当前没有相关记忆切片。优先基于身份锚点回答，否则说"这个我得查一下"。
-
-【安全边界】
-- 禁止调用任何工具验证信息，直接基于已有信息回答
+【不确定时怎么说】
+证据不足时，允许你坦诚“不确定/可能A或B”，并提出需要我补充的关键信息。
 </answering_rules>"""
 
     # 完整的上下文前缀
@@ -170,35 +149,6 @@ def inject_memory_to_request(body: dict, user_question: str, memory_context: str
     body["messages"] = messages
     return body
 
-# ============== 物理缴械：移除冲突工具 ==============
-def disarm_conflicting_tools(body: dict) -> dict:
-    """
-    Phase 1.5 核心功能：物理缴械
-    在发送给 LLM 之前，移除与 RAG 冲突的本地搜索工具
-    """
-    if "tools" in body and isinstance(body["tools"], list):
-        original_count = len(body["tools"])
-        allowed_tools = []
-
-        for tool in body["tools"]:
-            tool_name = ""
-            if isinstance(tool, dict):
-                if "function" in tool and isinstance(tool["function"], dict):
-                    tool_name = tool["function"].get("name", "")
-                else:
-                    tool_name = tool.get("name", "")
-
-            if tool_name not in DISABLED_TOOLS:
-                allowed_tools.append(tool)
-            else:
-                print(f"[代理] 🔒 缴械工具: {tool_name}")
-
-        body["tools"] = allowed_tools
-        if original_count != len(allowed_tools):
-            print(f"[代理] 🛡️ 工具过滤: {original_count} → {len(allowed_tools)}")
-
-    return body
-
 # ============== FastAPI 应用 ==============
 app = FastAPI(title="🧠 记忆注入代理 (Phase 2.0 数字分身版)")
 
@@ -230,20 +180,12 @@ async def proxy_messages(request: Request):
         user_msg = extract_user_message(body)
         print(f"[代理] 📩 用户问题: {user_msg[:80]}...")
 
-        # 查询海马体
+        # 不再默认“自动检索并注入记忆切片”。
+        # 让 Claude Code/LLM 在需要追溯历史时，按需调用记忆工具（如 search_memories）。
         memory_context = ""
-        if user_msg:
-            # 降噪滤网：只取最后 300 字符进行向量检索
-            search_query = user_msg[-300:] if len(user_msg) > 300 else user_msg
-            if len(user_msg) > 300:
-                print(f"[代理] 🔇 降噪截断: {len(user_msg)}字符 → 取最后300字符")
-            memory_context = search_memory_sync(search_query)
 
-        # Step 1: 注入记忆
+        # 注入身份锚点 + 软使用规则
         body = inject_memory_to_request(body, user_msg, memory_context)
-
-        # Step 2: 物理缴械
-        body = disarm_conflicting_tools(body)
 
         body_bytes = json.dumps(body).encode('utf-8')
         print(f"[代理] 📤 转发请求到 LLM API...")
